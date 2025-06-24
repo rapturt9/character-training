@@ -57,14 +57,46 @@ def save_system_prompts(prompts: Dict[str, str]):
     with open(SYSTEM_PROMPTS_FILE, 'w') as f:
         json.dump(prompts, f, indent=2)
 
-def save_conversation(conversation_id: str, messages: List[Dict], system_prompt: str = ""):
+def summarize_conversation_with_claude(messages: List[Dict], api_key: str) -> str:
+    """Summarize a conversation using Claude 3.5 Haiku."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+    # Only include user/assistant messages for summary
+    summary_messages = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in messages if msg["role"] in ("user", "assistant")
+    ]
+    # Compose a prompt for summarization
+    prompt = (
+        "Summarize the following conversation in 2-3 sentences for future reference. "
+        "Be concise and capture the main topics and tone.\n\n"
+        "Conversation:\n"
+    )
+    for msg in summary_messages:
+        prompt += f"{msg['role'].capitalize()}: {msg['content']}\n"
+    try:
+        response = client.messages.create(
+            model="claude-3-5-haiku-latest",
+            max_tokens=256,
+            system="You are a helpful assistant that summarizes conversations for future reference.",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"Error summarizing conversation: {e}")
+        return "[Summary unavailable due to error]"
+
+def save_conversation(conversation_id: str, messages: List[Dict], system_prompt: str = "", provider: str = "", model: str = "", summary: str = ""):
     """Save conversation to local file"""
     filename = f"{CONVERSATIONS_DIR}/conversation_{conversation_id}.json"
     conversation_data = {
         "id": conversation_id,
         "created_at": datetime.now().isoformat(),
         "messages": messages,
-        "system_prompt": system_prompt
+        "system_prompt": system_prompt,
+        "provider": provider,
+        "model": model,
+        "summary": summary
     }
     with open(filename, 'w') as f:
         json.dump(conversation_data, f, indent=2)
@@ -349,14 +381,42 @@ def main():
                         st.session_state.messages.append({"role": "assistant", "content": response})
                         st.caption(f"Message ID: {st.session_state.conversation_id}:{len(st.session_state.messages)-1}")
                         
-                        # Save conversation
-                        save_conversation(st.session_state.conversation_id, st.session_state.messages, st.session_state.system_prompt)
+                        # Save conversation (now with provider and model, summary is not set here)
+                        save_conversation(
+                            st.session_state.conversation_id,
+                            st.session_state.messages,
+                            st.session_state.system_prompt,
+                            provider,
+                            model,
+                            summary=""
+                        )
                         
                     except Exception as e:
                         st.error(f"Error: {str(e)}")
         
         # New conversation button
         if st.button("Start New Conversation"):
+            # Summarize previous conversation if it exists and has messages
+            if st.session_state.messages:
+                # Try to get Claude API key from env or sidebar
+                haiku_key = os.getenv("ANTHROPIC_API_KEY")
+                if provider == "Anthropic":
+                    haiku_key = api_key or haiku_key
+                if haiku_key:
+                    summary = summarize_conversation_with_claude(
+                        st.session_state.messages, haiku_key
+                    )
+                else:
+                    summary = "[No Claude API key available for summary]"
+                # Save summary to previous conversation
+                save_conversation(
+                    st.session_state.conversation_id,
+                    st.session_state.messages,
+                    st.session_state.system_prompt,
+                    provider,
+                    model,
+                    summary=summary
+                )
             st.session_state.messages = []
             st.session_state.conversation_id = str(uuid.uuid4())
             st.rerun()
@@ -383,6 +443,9 @@ def main():
                 if conversation:
                     st.success("Conversation found:")
                     st.json(conversation)
+                    # Show summary if available
+                    if conversation.get("summary"):
+                        st.info(f"Summary: {conversation['summary']}")
                 else:
                     st.error("Conversation not found")
         
