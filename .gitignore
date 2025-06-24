@@ -1,1 +1,4 @@
 .env
+/conversations
+/__pycache__
+*.log

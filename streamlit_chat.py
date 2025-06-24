@@ -2,11 +2,23 @@ import streamlit as st
 import json
 import os
 import uuid
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional
 import anthropic
 import openai
 import requests
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('streamlit_chat.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Configuration
 SYSTEM_PROMPTS_FILE = "system_prompts.json"
@@ -46,13 +58,14 @@ def save_system_prompts(prompts: Dict[str, str]):
     with open(SYSTEM_PROMPTS_FILE, 'w') as f:
         json.dump(prompts, f, indent=2)
 
-def save_conversation(conversation_id: str, messages: List[Dict]):
+def save_conversation(conversation_id: str, messages: List[Dict], system_prompt: str = ""):
     """Save conversation to local file"""
     filename = f"{CONVERSATIONS_DIR}/conversation_{conversation_id}.json"
     conversation_data = {
         "id": conversation_id,
         "created_at": datetime.now().isoformat(),
-        "messages": messages
+        "messages": messages,
+        "system_prompt": system_prompt
     }
     with open(filename, 'w') as f:
         json.dump(conversation_data, f, indent=2)
@@ -81,6 +94,14 @@ def call_anthropic_api(messages: List[Dict], system_prompt: str, api_key: str, m
         if msg["role"] != "system":
             formatted_messages.append({"role": msg["role"], "content": msg["content"]})
     
+    # Log the system prompt and conversation for verification
+    logger.info(f"ANTHROPIC API CALL - Model: {model}")
+    logger.info(f"SYSTEM PROMPT: {system_prompt[:200]}{'...' if len(system_prompt) > 200 else ''}")
+    logger.info(f"CONVERSATION HISTORY ({len(formatted_messages)} messages):")
+    for i, msg in enumerate(formatted_messages):
+        content_preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+        logger.info(f"  [{i}] {msg['role']}: {content_preview}")
+    
     response = client.messages.create(
         model=model,
         max_tokens=4000,
@@ -96,6 +117,13 @@ def call_openai_api(messages: List[Dict], system_prompt: str, api_key: str, mode
     formatted_messages = [{"role": "system", "content": system_prompt}]
     formatted_messages.extend(messages)
     
+    # Log the system prompt and conversation for verification
+    logger.info(f"OPENAI API CALL - Model: {model}")
+    logger.info(f"FORMATTED MESSAGES ({len(formatted_messages)} total):")
+    for i, msg in enumerate(formatted_messages):
+        content_preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+        logger.info(f"  [{i}] {msg['role']}: {content_preview}")
+    
     response = client.chat.completions.create(
         model=model,
         messages=formatted_messages
@@ -106,6 +134,13 @@ def call_openrouter_api(messages: List[Dict], system_prompt: str, api_key: str, 
     """Call OpenRouter API"""
     formatted_messages = [{"role": "system", "content": system_prompt}]
     formatted_messages.extend(messages)
+    
+    # Log the system prompt and conversation for verification
+    logger.info(f"OPENROUTER API CALL - Model: {model}")
+    logger.info(f"FORMATTED MESSAGES ({len(formatted_messages)} total):")
+    for i, msg in enumerate(formatted_messages):
+        content_preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+        logger.info(f"  [{i}] {msg['role']}: {content_preview}")
     
     response = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -124,6 +159,34 @@ def main():
     st.set_page_config(page_title="AI Chat Interface", layout="wide")
     
     ensure_directories()
+    
+    # Initialize session state early
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "conversation_id" not in st.session_state:
+        st.session_state.conversation_id = str(uuid.uuid4())
+    if "system_prompt" not in st.session_state:
+        st.session_state.system_prompt = ""
+    
+    # Handle conversation loading from query parameters
+    load_conv_id = st.query_params.get("load_conv_id")
+    if load_conv_id and load_conv_id != st.session_state.conversation_id:
+        conversation = load_conversation(load_conv_id)
+        if conversation:
+            st.session_state.messages = conversation["messages"]
+            st.session_state.conversation_id = load_conv_id
+            # Restore system prompt if available
+            if "system_prompt" in conversation:
+                st.session_state.system_prompt = conversation["system_prompt"]
+            # Handle message highlighting
+            highlight_msg = st.query_params.get("highlight_msg")
+            if highlight_msg:
+                try:
+                    st.session_state.highlight_message = int(highlight_msg)
+                except ValueError:
+                    pass
+            # Clear query parameters
+            st.query_params.clear()
     
     st.title("AI Chat Interface")
     
@@ -160,11 +223,13 @@ def main():
         prompt_names = list(saved_prompts.keys())
         if prompt_names:
             selected_prompt = st.selectbox("Load Saved Prompt", [""] + prompt_names)
-            if selected_prompt:
+            if selected_prompt and selected_prompt != st.session_state.get("selected_prompt", ""):
                 st.session_state.system_prompt = saved_prompts[selected_prompt]
+                st.session_state.selected_prompt = selected_prompt
+                st.rerun()
         
         # Save current prompt
-        if "system_prompt" in st.session_state and st.session_state.system_prompt:
+        if st.session_state.system_prompt:
             prompt_name = st.text_input("Save Prompt As:")
             if st.button("Save Prompt"):
                 if prompt_name:
@@ -179,19 +244,23 @@ def main():
     with col1:
         st.header("Chat")
         
-        # System prompt input
-        system_prompt = st.text_area(
-            "System Prompt",
-            value=st.session_state.get("system_prompt", ""),
-            height=100,
-            key="system_prompt"
-        )
-        
-        # Initialize session state
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-        if "conversation_id" not in st.session_state:
-            st.session_state.conversation_id = str(uuid.uuid4())
+        # System prompt configuration - prominent section
+        with st.expander("🎯 System Prompt Configuration", expanded=not bool(st.session_state.system_prompt)):
+            st.markdown("**Configure the AI's behavior and personality before starting the conversation.**")
+            system_prompt = st.text_area(
+                "System Prompt",
+                value=st.session_state.system_prompt,
+                height=100,
+                key="system_prompt",
+                placeholder="Enter a system prompt to define the AI's behavior (e.g., 'You are a helpful assistant', etc.)"
+            )
+            if st.button("Set System Prompt"):
+                if system_prompt.strip():
+                    st.session_state.system_prompt = system_prompt.strip()
+                    st.success("System prompt set successfully!")
+                    st.rerun()
+                else:
+                    st.warning("Please enter a system prompt before setting it.")
         
         # Message ID jump functionality
         message_id_input = st.text_input("Jump to Message ID (format: conversation_id:message_index)")
@@ -205,9 +274,9 @@ def main():
                     if conv_id != st.session_state.conversation_id:
                         conversation = load_conversation(conv_id)
                         if conversation:
-                            st.session_state.messages = conversation["messages"]
-                            st.session_state.conversation_id = conv_id
-                            st.session_state.highlight_message = msg_idx
+                            # Set query parameters to trigger reload with new data
+                            st.query_params["load_conv_id"] = conv_id
+                            st.query_params["highlight_msg"] = str(msg_idx)
                             st.rerun()
                         else:
                             st.error("Conversation not found")
@@ -234,7 +303,7 @@ def main():
             with st.chat_message(message["role"]):
                 if is_highlighted:
                     st.markdown(f"🔍 **HIGHLIGHTED MESSAGE**")
-                    st.markdown(f"<div style='background-color: #fff3cd; padding: 10px; border-radius: 5px; border-left: 4px solid #ffc107;'>{message['content']}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='background-color: #b8860b; color: #fff; padding: 10px; border-radius: 5px; border-left: 4px solid #ffc107;'>{message['content']}</div>", unsafe_allow_html=True)
                     # Clear highlight after showing
                     if st.session_state.get("highlight_message") == i:
                         st.session_state.highlight_message = None
@@ -248,6 +317,10 @@ def main():
                 st.error("Please enter your API key in the sidebar")
                 return
             
+            if not st.session_state.system_prompt.strip():
+                st.error("Please set a system prompt before starting the conversation")
+                return
+            
             # Add user message
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
@@ -259,18 +332,18 @@ def main():
                 with st.spinner("Thinking..."):
                     try:
                         if provider == "Anthropic":
-                            response = call_anthropic_api(st.session_state.messages, system_prompt, api_key, model)
+                            response = call_anthropic_api(st.session_state.messages, st.session_state.system_prompt, api_key, model)
                         elif provider == "OpenAI":
-                            response = call_openai_api(st.session_state.messages, system_prompt, api_key, model)
+                            response = call_openai_api(st.session_state.messages, st.session_state.system_prompt, api_key, model)
                         elif provider == "OpenRouter":
-                            response = call_openrouter_api(st.session_state.messages, system_prompt, api_key, model)
+                            response = call_openrouter_api(st.session_state.messages, st.session_state.system_prompt, api_key, model)
                         
                         st.markdown(response)
                         st.session_state.messages.append({"role": "assistant", "content": response})
                         st.caption(f"Message ID: {st.session_state.conversation_id}:{len(st.session_state.messages)-1}")
                         
                         # Save conversation
-                        save_conversation(st.session_state.conversation_id, st.session_state.messages)
+                        save_conversation(st.session_state.conversation_id, st.session_state.messages, st.session_state.system_prompt)
                         
                     except Exception as e:
                         st.error(f"Error: {str(e)}")
@@ -312,12 +385,9 @@ def main():
             conversation_files = [f for f in os.listdir(CONVERSATIONS_DIR) if f.endswith('.json')]
             for file in conversation_files:
                 conv_id = file.replace('conversation_', '').replace('.json', '')
-                if st.button(f"Load {conv_id[:8]}..."):
-                    conversation = load_conversation(conv_id)
-                    if conversation:
-                        st.session_state.messages = conversation["messages"]
-                        st.session_state.conversation_id = conv_id
-                        st.rerun()
+                if st.button(f"Load {conv_id[:8]}...", key=f"load_{conv_id}"):
+                    st.query_params["load_conv_id"] = conv_id
+                    st.rerun()
 
 if __name__ == "__main__":
     main()
