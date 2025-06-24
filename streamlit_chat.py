@@ -37,7 +37,6 @@ OPENAI_MODELS = [
 ]
 
 OPENROUTER_MODELS = [
-    "allenai/olmo-2-0325-32b-instruct",
     "mistralai/mistral-small-3.2-24b-instruct"
 ]
 
@@ -153,7 +152,22 @@ def call_openrouter_api(messages: List[Dict], system_prompt: str, api_key: str, 
             "messages": formatted_messages
         }
     )
-    return response.json()["choices"][0]["message"]["content"]
+    # Debug: log the full response
+    logger.info(f"OpenRouter raw response: {response.text}")
+    try:
+        data = response.json()
+        # Defensive: handle different response structures
+        if "choices" in data and data["choices"]:
+            return data["choices"][0]["message"]["content"]
+        elif "message" in data:
+            # Some models may return a single message object
+            return data["message"].get("content", str(data["message"]))
+        else:
+            # Unexpected structure, return the whole response for debugging
+            return f"[OpenRouter API returned unexpected format]\n{json.dumps(data, indent=2)}"
+    except Exception as e:
+        logger.error(f"Error parsing OpenRouter response: {e}")
+        return f"[Error parsing OpenRouter response: {e}]\nRaw response: {response.text}"
 
 def main():
     st.set_page_config(page_title="AI Chat Interface", layout="wide")
@@ -195,7 +209,7 @@ def main():
         st.header("Configuration")
         
         # API Provider Selection
-        provider = st.selectbox("Select API Provider", ["Anthropic", "OpenAI", "OpenRouter"])
+        provider = st.selectbox("Select API Provider", ["Anthropic", "OpenAI", "OpenRouter"], index=2)
         
         # Get API key from environment or user input
         if provider == "Anthropic":
@@ -254,13 +268,6 @@ def main():
                 key="system_prompt",
                 placeholder="Enter a system prompt to define the AI's behavior (e.g., 'You are a helpful assistant', etc.)"
             )
-            if st.button("Set System Prompt"):
-                if system_prompt.strip():
-                    st.session_state.system_prompt = system_prompt.strip()
-                    st.success("System prompt set successfully!")
-                    st.rerun()
-                else:
-                    st.warning("Please enter a system prompt before setting it.")
         
         # Message ID jump functionality
         message_id_input = st.text_input("Jump to Message ID (format: conversation_id:message_index)")
