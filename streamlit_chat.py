@@ -5,9 +5,17 @@ import uuid
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional
-import anthropic
-import openai
-import requests
+import sqlite3
+import asyncio
+from database import (
+    init_db,
+    save_conversation_to_db,
+    load_conversation_from_db,
+    get_all_conversations_from_db,
+    get_message_by_index_from_db,
+    migrate_json_to_sqlite
+)
+from llm_api import call_llm_api
 
 # Configure logging
 logging.basicConfig(
@@ -22,28 +30,32 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 SYSTEM_PROMPTS_FILE = "system_prompts.json"
-CONVERSATIONS_DIR = "conversations"
+CONVERSATIONS_DIR = "conversations" # Keep for migration
+DATABASE_FILE = "conversations.db"
+
 
 # Model options for each provider
 ANTHROPIC_MODELS = [
-    "claude-3-5-haiku-latest",
-    "claude-sonnet-4-20250514",
-    "claude-opus-4-20250514",
+    "anthropic/claude-3-5-haiku-latest",
+    "anthropic/claude-sonnet-4-20250514",
+    "anthropic/claude-opus-4-20250514",
 ]
 
 OPENAI_MODELS = [
-    "gpt-4o-mini",
-    "o4-mini"
+    "openai/gpt-4o-mini",
+    "openai/o4-mini"
 ]
 
 OPENROUTER_MODELS = [
-    "mistralai/mistral-small-3.2-24b-instruct"
+    "openrouter/mistralai/mistral-small-3.2-24b-instruct"
 ]
+
 
 def ensure_directories():
     """Ensure required directories exist"""
     if not os.path.exists(CONVERSATIONS_DIR):
         os.makedirs(CONVERSATIONS_DIR)
+
 
 def load_system_prompts() -> Dict[str, str]:
     """Load saved system prompts from JSON file"""
@@ -52,15 +64,15 @@ def load_system_prompts() -> Dict[str, str]:
             return json.load(f)
     return {}
 
+
 def save_system_prompts(prompts: Dict[str, str]):
     """Save system prompts to JSON file"""
     with open(SYSTEM_PROMPTS_FILE, 'w') as f:
         json.dump(prompts, f, indent=2)
 
-def summarize_conversation_with_claude(messages: List[Dict], api_key: str) -> str:
-    """Summarize a conversation using Claude 3.5 Haiku."""
-    import anthropic
-    client = anthropic.Anthropic(api_key=api_key)
+
+def summarize_conversation(messages: List[Dict], model: str) -> str:
+    """Summarize a conversation using a specified model via the central API call."""
     # Only include user/assistant messages for summary
     summary_messages = [
         {"role": msg["role"], "content": msg["content"]}
@@ -75,152 +87,85 @@ def summarize_conversation_with_claude(messages: List[Dict], api_key: str) -> st
     for msg in summary_messages:
         prompt += f"{msg['role'].capitalize()}: {msg['content']}\n"
     try:
-        response = client.messages.create(
-            model="claude-3-5-haiku-latest",
-            max_tokens=256,
-            system="You are a helpful assistant that summarizes conversations for future reference.",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.content[0].text.strip()
+        api_messages = [
+            {"role": "system", "content": "You are a helpful assistant that summarizes conversations for future reference."},
+            {"role": "user", "content": prompt}
+        ]
+        summary = asyncio.run(call_llm_api(
+            messages=api_messages,
+            model=model
+        ))
+        return summary.strip()
     except Exception as e:
         logger.error(f"Error summarizing conversation: {e}")
         return "[Summary unavailable due to error]"
 
-def save_conversation(conversation_id: str, messages: List[Dict], system_prompt: str = "", provider: str = "", model: str = "", summary: str = ""):
-    """Save conversation to local file"""
-    filename = f"{CONVERSATIONS_DIR}/conversation_{conversation_id}.json"
-    conversation_data = {
-        "id": conversation_id,
-        "created_at": datetime.now().isoformat(),
-        "messages": messages,
-        "system_prompt": system_prompt,
-        "provider": provider,
-        "model": model,
-        "summary": summary
-    }
-    with open(filename, 'w') as f:
-        json.dump(conversation_data, f, indent=2)
+
+def save_conversation(conversation_id: str, messages: List[Dict], system_prompt: str = "", model: str = "", summary: str = ""):
+    """Save conversation to the database."""
+    provider = model.split('/')[0] if '/' in model else "unknown"
+    save_conversation_to_db(conversation_id, messages, system_prompt, provider, model, summary)
+
 
 def load_conversation(conversation_id: str) -> Optional[Dict]:
-    """Load conversation from local file"""
+    """Load conversation from DB, with a fallback to JSON for backward compatibility."""
+    # Try loading from the database first
+    conversation = load_conversation_from_db(conversation_id)
+    if conversation:
+        return conversation
+    
+    # Fallback to legacy JSON file
     filename = f"{CONVERSATIONS_DIR}/conversation_{conversation_id}.json"
     if os.path.exists(filename):
         with open(filename, 'r') as f:
             return json.load(f)
+            
     return None
+
 
 def get_message_by_index(conversation_id: str, message_index: int) -> Optional[Dict]:
-    """Get specific message from conversation by index"""
-    conversation = load_conversation(conversation_id)
-    if conversation and 0 <= message_index < len(conversation["messages"]):
-        return conversation["messages"][message_index]
-    return None
+    """Get specific message from conversation by index from the database."""
+    return get_message_by_index_from_db(conversation_id, message_index)
 
-def call_anthropic_api(messages: List[Dict], system_prompt: str, api_key: str, model: str) -> str:
-    """Call Anthropic Claude API"""
-    client = anthropic.Anthropic(api_key=api_key)
-    
-    formatted_messages = []
-    for msg in messages:
-        if msg["role"] != "system":
-            formatted_messages.append({"role": msg["role"], "content": msg["content"]})
-    
-    # Log the system prompt and conversation for verification
-    logger.info(f"ANTHROPIC API CALL - Model: {model}")
-    logger.info(f"SYSTEM PROMPT: {system_prompt[:200]}{'...' if len(system_prompt) > 200 else ''}")
-    logger.info(f"CONVERSATION HISTORY ({len(formatted_messages)} messages):")
-    for i, msg in enumerate(formatted_messages):
-        content_preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
-        logger.info(f"  [{i}] {msg['role']}: {content_preview}")
-    
-    response = client.messages.create(
-        model=model,
-        max_tokens=4000,
-        system=system_prompt,
-        messages=formatted_messages
-    )
-    return response.content[0].text
 
-def call_openai_api(messages: List[Dict], system_prompt: str, api_key: str, model: str) -> str:
-    """Call OpenAI API"""
-    client = openai.OpenAI(api_key=api_key)
-    
-    formatted_messages = [{"role": "system", "content": system_prompt}]
-    formatted_messages.extend(messages)
-    
-    # Log the system prompt and conversation for verification
-    logger.info(f"OPENAI API CALL - Model: {model}")
-    logger.info(f"FORMATTED MESSAGES ({len(formatted_messages)} total):")
-    for i, msg in enumerate(formatted_messages):
-        content_preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
-        logger.info(f"  [{i}] {msg['role']}: {content_preview}")
-    
-    response = client.chat.completions.create(
-        model=model,
-        messages=formatted_messages
-    )
-    return response.choices[0].message.content
+def list_available_conversations() -> List[Dict]:
+    """List all available conversations from the database."""
+    return get_all_conversations_from_db()
 
-def call_openrouter_api(messages: List[Dict], system_prompt: str, api_key: str, model: str) -> str:
-    """Call OpenRouter API"""
-    formatted_messages = [{"role": "system", "content": system_prompt}]
-    formatted_messages.extend(messages)
-    
-    # Log the system prompt and conversation for verification
-    logger.info(f"OPENROUTER API CALL - Model: {model}")
-    logger.info(f"FORMATTED MESSAGES ({len(formatted_messages)} total):")
-    for i, msg in enumerate(formatted_messages):
-        content_preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
-        logger.info(f"  [{i}] {msg['role']}: {content_preview}")
-    
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": model,
-            "messages": formatted_messages
-        }
-    )
-    # Debug: log the full response
-    logger.info(f"OpenRouter raw response: {response.text}")
-    try:
-        data = response.json()
-        # Defensive: handle different response structures
-        if "choices" in data and data["choices"]:
-            return data["choices"][0]["message"]["content"]
-        elif "message" in data:
-            # Some models may return a single message object
-            return data["message"].get("content", str(data["message"]))
-        else:
-            # Unexpected structure, return the whole response for debugging
-            return f"[OpenRouter API returned unexpected format]\n{json.dumps(data, indent=2)}"
-    except Exception as e:
-        logger.error(f"Error parsing OpenRouter response: {e}")
-        return f"[Error parsing OpenRouter response: {e}]\nRaw response: {response.text}"
 
 def main():
     st.set_page_config(page_title="AI Chat Interface", layout="wide")
+    logger.info("--- Starting Streamlit App ---")
+    
+    # Initialize the database and migrate old files
+    init_db()
+    logger.info("Database initialized.")
+    migrate_json_to_sqlite()
+    logger.info("Migration check complete.")
     
     ensure_directories()
     
     # Initialize session state early
     if "messages" not in st.session_state:
         st.session_state.messages = []
+        logger.info("Initialized 'messages' in session state.")
     if "conversation_id" not in st.session_state:
         st.session_state.conversation_id = str(uuid.uuid4())
+        logger.info("Initialized 'conversation_id' in session state.")
     if "system_prompt" not in st.session_state:
         st.session_state.system_prompt = ""
+        logger.info("Initialized 'system_prompt' in session state.")
     
     # Handle conversation loading from query parameters
+    logger.info("Checking for 'load_conv_id' in query parameters.")
     load_conv_id = st.query_params.get("load_conv_id")
     if load_conv_id and load_conv_id != st.session_state.conversation_id:
+        logger.info(f"Attempting to load conversation: {load_conv_id}")
         conversation = load_conversation(load_conv_id)
         if conversation:
             st.session_state.messages = conversation["messages"]
             st.session_state.conversation_id = load_conv_id
+            logger.info(f"Successfully loaded conversation {load_conv_id}.")
             # Restore system prompt if available
             if "system_prompt" in conversation:
                 st.session_state.system_prompt = conversation["system_prompt"]
@@ -233,30 +178,27 @@ def main():
                     pass
             # Clear query parameters
             st.query_params.clear()
+            logger.info("Cleared query parameters.")
     
     st.title("AI Chat Interface")
+    logger.info("Rendered page title.")
     
     # Sidebar for configuration
     with st.sidebar:
         st.header("Configuration")
+        logger.info("Rendering sidebar.")
         
         # API Provider Selection
-        provider = st.selectbox("Select API Provider", ["Anthropic", "OpenAI", "OpenRouter"], index=2)
+        # This is now simplified as the provider is determined from the model
+        st.info("Select a model below. The provider (OpenAI, Anthropic, OpenRouter) will be inferred automatically.")
         
-        # Get API key from environment or user input
-        if provider == "Anthropic":
-            env_key = os.getenv("ANTHROPIC_API_KEY")
-            api_key = st.text_input("API Key", value=env_key if env_key else "", type="password")
-            model = st.selectbox("Model", ANTHROPIC_MODELS)
-        elif provider == "OpenAI":
-            env_key = os.getenv("OPENAI_API_KEY")
-            api_key = st.text_input("API Key", value=env_key if env_key else "", type="password")
-            model = st.selectbox("Model", OPENAI_MODELS)
-        elif provider == "OpenRouter":
-            env_key = os.getenv("OPENROUTER_API_KEY")
-            api_key = st.text_input("API Key", value=env_key if env_key else "", type="password")
-            model = st.selectbox("Model", OPENROUTER_MODELS)
+        all_models = OPENAI_MODELS + ANTHROPIC_MODELS + OPENROUTER_MODELS
+        model = st.selectbox("Select Model", all_models, index=all_models.index("openrouter/mistralai/mistral-small-3.2-24b-instruct"))
         
+        # API keys are now handled by the central llm_api.py, which reads from env vars.
+        # We can add a note to the user.
+        st.caption("Ensure `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `OPENROUTER_API_KEY` are set in your environment variables.")
+
         st.divider()
         
         # System Prompt Management
@@ -283,9 +225,30 @@ def main():
                     save_system_prompts(saved_prompts)
                     st.success(f"Prompt saved as '{prompt_name}'")
                     st.rerun()
+        
+        st.divider()
+
+        # Conversation History
+        st.header("Conversation History")
+        available_conversations = list_available_conversations()
+        logger.info(f"Found {len(available_conversations)} available conversations.")
+        
+        if available_conversations:
+            for convo in available_conversations:
+                summary = convo.get('summary', 'No summary available')
+                timestamp = datetime.fromisoformat(convo['created_at']).strftime('%Y-%m-%d %H:%M')
+                
+                button_label = f"**{timestamp}**\n_{summary}_"
+                if st.button(button_label, key=convo['id']):
+                    st.query_params["load_conv_id"] = convo['id']
+                    st.rerun()
+        else:
+            st.write("No past conversations found.")
+
     
     # Main chat interface
     col1, col2 = st.columns([2, 1])
+    logger.info("Rendered main columns.")
     
     with col1:
         st.header("Chat")
@@ -352,9 +315,7 @@ def main():
         
         # Chat input
         if prompt := st.chat_input("What would you like to discuss?"):
-            if not api_key:
-                st.error("Please enter your API key in the sidebar")
-                return
+            # API keys are checked within the call_llm_api function
             
             if not st.session_state.system_prompt.strip():
                 st.error("Please set a system prompt before starting the conversation")
@@ -370,12 +331,13 @@ def main():
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     try:
-                        if provider == "Anthropic":
-                            response = call_anthropic_api(st.session_state.messages, st.session_state.system_prompt, api_key, model)
-                        elif provider == "OpenAI":
-                            response = call_openai_api(st.session_state.messages, st.session_state.system_prompt, api_key, model)
-                        elif provider == "OpenRouter":
-                            response = call_openrouter_api(st.session_state.messages, st.session_state.system_prompt, api_key, model)
+                        # Prepare messages for the API call, including the system prompt
+                        api_messages = [{"role": "system", "content": st.session_state.system_prompt}] + st.session_state.messages
+                        
+                        response = asyncio.run(call_llm_api(
+                            messages=api_messages,
+                            model=model
+                        ))
                         
                         st.markdown(response)
                         st.session_state.messages.append({"role": "assistant", "content": response})
@@ -386,7 +348,6 @@ def main():
                             st.session_state.conversation_id,
                             st.session_state.messages,
                             st.session_state.system_prompt,
-                            provider,
                             model,
                             summary=""
                         )
@@ -398,22 +359,20 @@ def main():
         if st.button("Start New Conversation"):
             # Summarize previous conversation if it exists and has messages
             if st.session_state.messages:
-                # Try to get Claude API key from env or sidebar
-                haiku_key = os.getenv("ANTHROPIC_API_KEY")
-                if provider == "Anthropic":
-                    haiku_key = api_key or haiku_key
-                if haiku_key:
-                    summary = summarize_conversation_with_claude(
-                        st.session_state.messages, haiku_key
-                    )
-                else:
-                    summary = "[No Claude API key available for summary]"
+                # We can use any capable model for summarization. Let's default to a fast one.
+                summary_model = "anthropic/claude-3-5-haiku-latest"
+                summary = summarize_conversation(
+                    st.session_state.messages, summary_model
+                )
+                
+                # Determine provider for logging
+                provider = model.split('/')[0] if '/' in model else "Unknown"
+
                 # Save summary to previous conversation
                 save_conversation(
                     st.session_state.conversation_id,
                     st.session_state.messages,
                     st.session_state.system_prompt,
-                    provider,
                     model,
                     summary=summary
                 )
@@ -422,42 +381,38 @@ def main():
             st.rerun()
     
     with col2:
-        st.header("Message Retrieval")
+        st.header("Tools")
+        logger.info("Rendering tools column.")
         
-        # Chat ID and message lookup
-        lookup_conversation_id = st.text_input("Conversation ID")
-        message_index = st.number_input("Message Index", min_value=0, value=0)
-        
-        if st.button("Get Message"):
-            if lookup_conversation_id:
-                message = get_message_by_index(lookup_conversation_id, message_index)
-                if message:
-                    st.success("Message found:")
-                    st.json(message)
-                else:
-                    st.error("Message not found")
-        
-        if st.button("Get Full Conversation"):
-            if lookup_conversation_id:
-                conversation = load_conversation(lookup_conversation_id)
+        # Message and Conversation Retrieval Panel
+        with st.expander("🔍 Message & Conversation Retrieval", expanded=False):
+            st.markdown("**Retrieve specific messages or full conversations by ID.**")
+            
+            # Get specific message
+            st.subheader("Get Message by ID")
+            msg_id_input = st.text_input("Enter Message ID (e.g., `conversation_id:message_index`)")
+            if st.button("Get Message"):
+                try:
+                    conv_id, msg_idx = msg_id_input.split(':')
+                    message = get_message_by_index(conv_id, int(msg_idx))
+                    if message:
+                        st.json(message)
+                    else:
+                        st.error("Message not found.")
+                except (ValueError, IndexError):
+                    st.error("Invalid format. Use `conversation_id:message_index`.")
+
+            # Get full conversation
+            st.subheader("Get Full Conversation")
+            conv_id_input = st.text_input("Enter Conversation ID")
+            if st.button("Get Full Conversation"):
+                conversation = load_conversation(conv_id_input)
                 if conversation:
-                    st.success("Conversation found:")
                     st.json(conversation)
-                    # Show summary if available
-                    if conversation.get("summary"):
-                        st.info(f"Summary: {conversation['summary']}")
                 else:
-                    st.error("Conversation not found")
-        
-        # List all conversations
-        st.subheader("Available Conversations")
-        if os.path.exists(CONVERSATIONS_DIR):
-            conversation_files = [f for f in os.listdir(CONVERSATIONS_DIR) if f.endswith('.json')]
-            for file in conversation_files:
-                conv_id = file.replace('conversation_', '').replace('.json', '')
-                if st.button(f"Load {conv_id[:8]}...", key=f"load_{conv_id}"):
-                    st.query_params["load_conv_id"] = conv_id
-                    st.rerun()
+                    st.error("Conversation not found.")
+
+    logger.info("--- Finished Rendering UI ---")
 
 if __name__ == "__main__":
     main()

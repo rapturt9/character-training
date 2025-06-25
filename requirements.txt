@@ -2,3 +2,5 @@ streamlit
 anthropic
 openai
 requests
+litellm
+pydantic
